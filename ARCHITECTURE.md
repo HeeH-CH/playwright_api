@@ -214,30 +214,29 @@ function cleanHtmlContent(html, options)
 #### 사용 예시
 ```javascript
 // 텍스트 콘텐츠만 추출
-const response = await fetch('/page/content', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    sessionId: 'session_1_xxx',
-    cleanOptions: {
-      clean: true,
-      removeImages: true,
-      removeScripts: true,
-      removeStyles: true,
-      removeForms: true,
-      removeIframes: true
-   // 추가 커스터마이즈가 필요하면 같은 cleanOptions에
-      allowedTags: ['p','h2','a']
-      allowedAttributes: { a:['href'], '*':[] }
-    }
-  })
+사용 예시:
+
+// denylist 예
+cleanHtmlContent(html, {
+  clean: true,
+  useDenylist: true,
+  denyTags: ['img','video','iframe'],
+  denySelectors: ['.sponsored','[data-ad]'],
+  denyAttributes: { '*': ['style','onclick'], a: ['rel','target'] },
+  denySchemes: ['javascript','data'],
+  denyAnchorHrefPatterns: ['^/out\\?', '([?&])ad=']
 });
 
-const result = await response.json();
-console.log(`원본: ${result.originalLength}자`);
-console.log(`정리 후: ${result.length}자`);
-console.log(`감소율: ${result.cleaningStats.reductionPercent}%`);
-```
+// allowlist 예(기존 그대로)
+cleanHtmlContent(html, {
+  clean: true,
+  useAllowlist: true,
+  allowedTags: ['p','a','strong','em','ul','ol','li','code','pre','blockquote','br'],
+  allowedAttributes: { a: ['href','title'] }
+});
+
+
+요약: useDenylist를 켠 뒤 denyTags/denySelectors/denyAttributes/denySchemes/denyAnchorHrefPatterns로 “not allowed”를 선언하면 전처리에서 제거하고, sanitize 단계는 느슨하게 유지한다. Allowlist를 켜면 allowlist가 우선한다.
 
 ### 모듈화 아키텍처
 
