@@ -234,7 +234,7 @@ cleanHtmlContent(html, {
   allowedTags: ['p','a','strong','em','ul','ol','li','code','pre','blockquote','br'],
   allowedAttributes: { a: ['href','title'] }
 });
-
+```
 
 요약: useDenylist를 켠 뒤 denyTags/denySelectors/denyAttributes/denySchemes/denyAnchorHrefPatterns로 “not allowed”를 선언하면 전처리에서 제거하고, sanitize 단계는 느슨하게 유지한다. Allowlist를 켜면 allowlist가 우선한다.
 
