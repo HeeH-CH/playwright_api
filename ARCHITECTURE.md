@@ -226,6 +226,9 @@ const response = await fetch('/page/content', {
       removeStyles: true,
       removeForms: true,
       removeIframes: true
+   // 추가 커스터마이즈가 필요하면 같은 cleanOptions에
+      allowedTags: ['p','h2','a']
+      allowedAttributes: { a:['href'], '*':[] }
     }
   })
 });
