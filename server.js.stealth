@@ -1,0 +1,1263 @@
+const express = require('express');
+const { chromium, firefox, webkit } = require('playwright');
+const { chromium: pwChromium } = require('playwright-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+
+// Stealth 플러그인 적용
+pwChromium.use(StealthPlugin());
+
+// 기본 User-Agent 및 Stealth 설정
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+
+// 전역 변수
+const sessions = new Map();
+let sessionCounter = 0;
+
+// 세션별 뮤텍스 관리
+const sessionMutexes = new Map();
+
+class Mutex {
+  constructor() {
+    this._locked = false;
+    this._waiting = [];
+  }
+
+  async lock() {
+    return new Promise((resolve) => {
+      if (!this._locked) {
+        this._locked = true;
+        resolve();
+      } else {
+        this._waiting.push(resolve);
+      }
+    });
+  }
+
+  unlock() {
+    if (this._waiting.length > 0) {
+      const resolve = this._waiting.shift();
+      resolve();
+    } else {
+      this._locked = false;
+    }
+  }
+
+  isLocked() {
+    return this._locked;
+  }
+}
+
+// 세션별 뮤텍스 획득
+function getSessionMutex(sessionId) {
+  if (!sessionMutexes.has(sessionId)) {
+    sessionMutexes.set(sessionId, new Mutex());
+  }
+  return sessionMutexes.get(sessionId);
+}
+
+// 뮤텍스로 래핑된 세션 실행 함수
+async function withSessionMutex(sessionId, operation) {
+  const mutex = getSessionMutex(sessionId);
+  
+  console.log(`🔒 세션 ${sessionId} 뮤텍스 락 요청 (대기: ${mutex._waiting.length})`);
+  
+  await mutex.lock();
+  
+  try {
+    console.log(`✅ 세션 ${sessionId} 뮤텍스 락 획득`);
+    const result = await operation();
+    return result;
+  } finally {
+    mutex.unlock();
+    console.log(`🔓 세션 ${sessionId} 뮤텍스 락 해제`);
+  }
+}
+
+// 세션 타임아웃 설정 (30분)
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30분
+
+// 자동 정리 함수 (lastActivity 기반)
+function cleanupExpiredSessions() {
+  const now = Date.now();
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    const lastActivityAge = now - session.lastActivity.getTime();
+    
+    if (lastActivityAge > SESSION_TIMEOUT) {
+      console.log(`🧹 비활성 세션 정리: ${sessionId} (마지막 활동: ${Math.round(lastActivityAge / 60000)}분 전)`);
+      
+      try {
+        session.browser.close();
+        sessions.delete(sessionId);
+        // 뮤텍스도 함께 정리
+        sessionMutexes.delete(sessionId);
+        console.log(`✅ 세션 ${sessionId} 정리 완료`);
+      } catch (error) {
+        console.error(`❌ 세션 ${sessionId} 정리 실패:`, error.message);
+        sessions.delete(sessionId); // 맵에서는 제거
+        sessionMutexes.delete(sessionId); // 뮤텍스도 제거
+      }
+    }
+  }
+}
+
+// 5분마다 만료된 세션 정리
+setInterval(cleanupExpiredSessions, 5 * 60 * 1000);
+
+// 유틸리티 함수
+function generateSessionId() {
+  return `session_${++sessionCounter}_${Date.now()}`;
+}
+
+function getSession(sessionId) {
+  const session = sessions.get(sessionId);
+  if (session) {
+    session.lastActivity = new Date(); // 활동 시간 업데이트
+  }
+  return session;
+}
+
+function resolveLocator(page, { 
+  selector, 
+  frameSelector, 
+  frameChain,
+  // getBy methods
+  getByRole,
+  getByText,
+  getByLabel,
+  getByPlaceholder,
+  getByAltText,
+  getByTitle,
+  getByTestId,
+  // advanced methods
+  filter,
+  first,
+  last,
+  nth
+}) {
+  // Helper function to apply getBy methods to page/frame
+  function applyGetByMethod(pageOrFrame) {
+    if (getByRole) {
+      const { role, ...options } = typeof getByRole === 'string' 
+        ? { role: getByRole } 
+        : getByRole;
+      return pageOrFrame.getByRole(role, options);
+    }
+    if (getByText) {
+      const options = typeof getByText === 'string' 
+        ? { text: getByText } 
+        : getByText;
+      return pageOrFrame.getByText(options.text || options, {
+        exact: options.exact,
+        ignoreCase: options.ignoreCase
+      });
+    }
+    if (getByLabel) {
+      const options = typeof getByLabel === 'string' 
+        ? { text: getByLabel } 
+        : getByLabel;
+      return pageOrFrame.getByLabel(options.text || options, {
+        exact: options.exact,
+        ignoreCase: options.ignoreCase
+      });
+    }
+    if (getByPlaceholder) {
+      const options = typeof getByPlaceholder === 'string' 
+        ? { text: getByPlaceholder } 
+        : getByPlaceholder;
+      return pageOrFrame.getByPlaceholder(options.text || options, {
+        exact: options.exact,
+        ignoreCase: options.ignoreCase
+      });
+    }
+    if (getByAltText) {
+      const options = typeof getByAltText === 'string' 
+        ? { text: getByAltText } 
+        : getByAltText;
+      return pageOrFrame.getByAltText(options.text || options, {
+        exact: options.exact,
+        ignoreCase: options.ignoreCase
+      });
+    }
+    if (getByTitle) {
+      const options = typeof getByTitle === 'string' 
+        ? { text: getByTitle } 
+        : getByTitle;
+      return pageOrFrame.getByTitle(options.text || options, {
+        exact: options.exact,
+        ignoreCase: options.ignoreCase
+      });
+    }
+    if (getByTestId) {
+      return pageOrFrame.getByTestId(getByTestId);
+    }
+    
+    // fallback to selector
+    return pageOrFrame.locator(selector);
+  }
+
+  // A) frameSelector: 단일 프레임 선택자
+  if (frameSelector) {
+    const frameLocator = page.frameLocator(frameSelector);
+    const locator = applyGetByMethod(frameLocator);
+    return applyAdvancedMethods(locator);
+  }
+
+  // B) frameChain: 중첩 프레임 배열 지원
+  if (Array.isArray(frameChain) && frameChain.length > 0) {
+    let fl = page;
+    for (const fs of frameChain) {
+      fl = fl.frameLocator(fs);
+    }
+    const locator = applyGetByMethod(fl);
+    return applyAdvancedMethods(locator);
+  }
+
+  // C) '>>' 문법 지원 (frameA >> frameB >> .target)
+  if (typeof selector === 'string' && selector.includes('>>')) {
+    const parts = selector.split(/\s*>>\s+/).filter(p => p.trim());
+    let fl = page;
+    while (parts.length > 1) {
+      const fs = parts.shift();
+      fl = fl.frameLocator(fs);
+    }
+    const target = parts[0];
+    const locator = fl.locator(target);
+    return applyAdvancedMethods(locator);
+  }
+
+  // D) getBy methods 또는 기본 selector
+  const locator = applyGetByMethod(page);
+  return applyAdvancedMethods(locator);
+  
+  // Helper function to apply advanced methods (filter, first, last, nth)
+  function applyAdvancedMethods(locator) {
+    // Apply filter method
+    if (filter) {
+      if (filter.hasText !== undefined) {
+        locator = locator.filter({ hasText: filter.hasText });
+      }
+      if (filter.has !== undefined) {
+        locator = locator.filter({ has: page.locator(filter.has) });
+      }
+      if (filter.hasNot !== undefined) {
+        locator = locator.filter({ hasNot: page.locator(filter.hasNot) });
+      }
+    }
+    
+    // Apply positional methods
+    if (first === true) {
+      locator = locator.first();
+    } else if (last === true) {
+      locator = locator.last();
+    } else if (typeof nth === 'number') {
+      locator = locator.nth(nth);
+    }
+    
+    return locator;
+  }
+}
+
+// 세션 연장
+app.post('/session/extend', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = sessions.get(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    session.lastActivity = new Date();
+    
+    res.json({ 
+      success: true,
+      sessionId: sessionId,
+      extendedAt: session.lastActivity,
+      message: 'Session extended successfully'
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// CORS 설정
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(200);
+  } else {
+    next();
+  }
+});
+
+// 상태 확인
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    activeSessions: sessions.size,
+    uptime: process.uptime()
+  });
+});
+
+// 활성 세션 목록 (개선된 버전)
+app.get('/sessions', (req, res) => {
+  const now = new Date();
+  const sessionList = Array.from(sessions.entries()).map(([id, session]) => {
+    const ageMinutes = Math.round((now - session.createdAt) / 60000);
+    const inactiveMinutes = Math.round((now - session.lastActivity) / 60000);
+    const mutex = sessionMutexes.get(id);
+    return {
+      sessionId: id,
+      url: session.page ? session.page.url() : 'unknown',
+      createdAt: session.createdAt,
+      lastActivity: session.lastActivity,
+      ageMinutes: ageMinutes,
+      inactiveMinutes: inactiveMinutes,
+      status: inactiveMinutes > 30 ? 'expired' : 'active',
+      mutexStatus: {
+        locked: mutex ? mutex.isLocked() : false,
+        waitingCount: mutex ? mutex._waiting.length : 0
+      }
+    };
+  });
+  
+  res.json({ 
+    sessions: sessionList,
+    count: sessionList.length,
+    activeCount: sessionList.filter(s => s.status === 'active').length,
+    expiredCount: sessionList.filter(s => s.status === 'expired').length,
+    timeoutMinutes: SESSION_TIMEOUT / 60000,
+    mutexCount: sessionMutexes.size
+  });
+});
+
+// 모든 세션 강제 종료
+app.post('/sessions/cleanup', async (req, res) => {
+  const closedSessions = [];
+  const errors = [];
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    try {
+      await session.browser.close();
+      sessions.delete(sessionId);
+      sessionMutexes.delete(sessionId); // 뮤텍스도 함께 정리
+      closedSessions.push(sessionId);
+      console.log(`🧹 강제 종료: ${sessionId}`);
+    } catch (error) {
+      errors.push({ sessionId, error: error.message });
+      sessions.delete(sessionId); // 맵에서는 제거
+      sessionMutexes.delete(sessionId); // 뮤텍스도 제거
+    }
+  }
+  
+  res.json({
+    success: true,
+    closedSessions: closedSessions,
+    errors: errors,
+    message: `${closedSessions.length}개 세션 종료 완료`
+  });
+});
+
+// 1. 브라우저 시작
+app.post('/browser/launch', async (req, res) => {
+  try {
+    const { 
+      browser = 'chromium', 
+      headless = true, 
+      viewport = { width: 1920, height: 1080 },
+      userAgent,
+      locale = 'ko-KR',
+      timezone = 'Asia/Seoul'
+    } = req.body;
+
+    console.log(`🚀 브라우저 시작: ${browser}, headless: ${headless}`);
+
+    let browserInstance;
+    const launchOptions = {
+      headless,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+      ]
+    };
+
+    // 브라우저 타입별 실행
+    switch (browser.toLowerCase()) {
+      case 'firefox':
+        browserInstance = await firefox.launch(launchOptions);
+        break;
+      case 'webkit':
+        browserInstance = await webkit.launch(launchOptions);
+        break;
+      default:
+        // Stealth Chromium 사용 (탐지 우회 기능 포함)
+        launchOptions.args = [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-web-security',
+          '--disable-features=VizDisplayCompositor',
+          '--disable-blink-features=AutomationControlled',
+          '--disable-features=IsolateOrigins,site-per-process'
+        ];
+        browserInstance = await pwChromium.launch(launchOptions);
+    }
+
+    // Stealth 컨텍스트 설정 (우회 기능 강화)
+    const contextOptions = {
+      viewport: viewport || { width: 1366, height: 768 },
+      userAgent: userAgent || DEFAULT_USER_AGENT,
+      locale: locale || 'ko-KR',
+      timezoneId: timezone || 'Asia/Seoul',
+      geolocation: { longitude: 126.9780, latitude: 37.5665 },
+      permissions: ['geolocation'],
+      colorScheme: 'light',
+      javaScriptEnabled: true,
+      extraHTTPHeaders: {
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+      }
+    };
+
+    const context = await browserInstance.newContext(contextOptions);
+
+    // 우회 기능 강화 스크립트 추가
+    await context.addInitScript(() => {
+      // webdriver 흔적 최소화
+      Object.defineProperty(navigator, 'pdfViewerEnabled', { get: () => true });
+      // 플러그인 개수 채우기
+      Object.defineProperty(navigator, 'plugins', { get: () => [{}, {}, {}] });
+      // 추가 webdriver 속성 숨기기
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      // Chrome runtime 속성 마스킹
+      window.chrome = window.chrome || { runtime: {} };
+      // Permission API 마스킹
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+    });
+
+    // 새 페이지 생성
+    const page = await context.newPage();
+    const sessionId = generateSessionId();
+
+    // 세션 저장
+// 세션 생성시 lastActivity 추가
+    sessions.set(sessionId, {
+      browser: browserInstance,
+      context,
+      page,
+      createdAt: new Date(),
+      lastActivity: new Date() // 마지막 활동 시간 추가
+    });
+
+    console.log(`✅ 브라우저 시작 완료: ${sessionId}`);
+
+    res.json({ 
+      success: true, 
+      sessionId,
+      browser: browser,
+      headless: headless,
+      message: `${browser} browser launched successfully`
+    });
+
+  } catch (error) {
+    console.error('❌ 브라우저 시작 실패:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// 2. 브라우저 종료
+app.post('/browser/close', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Session not found' 
+      });
+    }
+
+    console.log(`🔄 브라우저 종료: ${sessionId}`);
+
+    await session.browser.close();
+    sessions.delete(sessionId);
+    // 뮤텍스도 함께 정리
+    sessionMutexes.delete(sessionId);
+    
+    console.log(`✅ 브라우저 종료 완료: ${sessionId}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'Browser closed successfully' 
+    });
+
+  } catch (error) {
+    console.error('❌ 브라우저 종료 실패:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// 3. 페이지 이동
+app.post('/page/goto', async (req, res) => {
+  try {
+    const { sessionId, url, options = {} } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'sessionId is required' 
+      });
+    }
+
+    const result = await withSessionMutex(sessionId, async () => {
+      const session = getSession(sessionId);
+      
+      if (!session) {
+        throw new Error('Session not found');
+      }
+
+      console.log(`🌐 페이지 이동: ${url}`);
+
+      // 네이버와 같은 무거운 사이트를 위한 개선된 페이지 로드 로직
+      const defaultOptions = {
+        waitUntil: 'domcontentloaded', // networkidle보다 안정적
+        timeout: 60000, // 30초 -> 60초로 증가
+        ...options
+      };
+
+      // 재시도 로직 (최대 2회)
+      let retryCount = 0;
+      const maxRetries = 2;
+      
+      while (retryCount <= maxRetries) {
+        try {
+          // 사람처럼 보이는 랜덤 딜레이 (500-1300ms)
+          await sleep(500 + Math.random() * 800);
+          await session.page.goto(url, defaultOptions);
+          // 페이지 로드 후 랜덤 마우스 이동
+          await sleep(200 + Math.random() * 400);
+          await session.page.mouse.move(
+            200 + Math.random() * 300,
+            300 + Math.random() * 200,
+            { steps: 12 }
+          );
+          break; // 성공하면 루프 탈출
+        } catch (error) {
+          retryCount++;
+          console.log(`⚠️ 페이지 로드 시도 ${retryCount}/${maxRetries + 1} 실패: ${error.message}`);
+          
+          if (retryCount > maxRetries) {
+            // 최종 실패 시 domcontentloaded로 한 번 더 시도
+            console.log('🔄 domcontentloaded로 최종 시도...');
+            await session.page.goto(url, {
+              ...defaultOptions,
+              waitUntil: 'domcontentloaded',
+              timeout: 45000
+            });
+            break;
+          }
+          
+          // 재시도 전 잠깐 대기
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      }
+
+      const pageInfo = {
+        url: session.page.url(),
+        title: await session.page.title()
+      };
+
+      console.log(`✅ 페이지 로드 완료: ${pageInfo.title}`);
+
+      return pageInfo;
+    });
+
+    res.json({ 
+      success: true, 
+      ...result
+    });
+
+  } catch (error) {
+    console.error('❌ 페이지 이동 실패:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message 
+    });
+  }
+});
+
+// 4. 페이지 새로고침
+app.post('/page/reload', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    await session.page.reload({ waitUntil: 'networkidle' });
+    
+    res.json({ 
+      success: true,
+      url: session.page.url(),
+      title: await session.page.title()
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 5. HTML 콘텐츠 가져오기
+app.post('/page/content', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    console.log('📄 HTML 콘텐츠 추출 중...');
+
+    const content = await session.page.content();
+    
+    console.log(`✅ HTML 추출 완료: ${content.length} 문자`);
+
+    res.json({ 
+      success: true, 
+      content: content,
+      length: content.length
+    });
+
+  } catch (error) {
+    console.error('❌ HTML 추출 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 6. 페이지 정보 가져오기
+app.post('/page/info', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const info = {
+      url: session.page.url(),
+      title: await session.page.title(),
+      timestamp: new Date().toISOString()
+    };
+
+    res.json({ success: true, info });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 7. JavaScript 실행 (브라우저 컨텍스트에서)
+app.post('/page/evaluate', async (req, res) => {
+  try {
+    const { sessionId, script } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    console.log('🔧 JavaScript 실행 중...');
+
+    // 브라우저 컨텍스트에서 스크립트 실행
+    const result = await session.page.evaluate((scriptToExecute) => {
+      return eval(scriptToExecute);
+    }, script);
+
+    console.log('✅ JavaScript 실행 완료');
+
+    res.json({ success: true, result });
+
+  } catch (error) {
+    console.error('❌ JavaScript 실행 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 8. 요소 클릭
+app.post('/page/click', async (req, res) => {
+  try {
+    const { 
+      sessionId, 
+      selector, 
+      frameSelector, 
+      frameChain, 
+      options = {},
+      getByRole,
+      getByText,
+      getByLabel,
+      getByPlaceholder,
+      getByAltText,
+      getByTitle,
+      getByTestId,
+      // advanced methods
+      filter,
+      first,
+      last,
+      nth
+    } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+
+    await withSessionMutex(sessionId, async () => {
+      const session = getSession(sessionId);
+      
+      if (!session) {
+        throw new Error('Session not found');
+      }
+
+      console.log(`🖱️ 클릭: ${selector || getByRole || getByText || getByLabel || getByPlaceholder || getByAltText || getByTitle || getByTestId}`);
+
+      const locator = resolveLocator(session.page, { 
+        selector, 
+        frameSelector, 
+        frameChain,
+        getByRole,
+        getByText,
+        getByLabel,
+        getByPlaceholder,
+        getByAltText,
+        getByTitle,
+        getByTestId,
+        filter,
+        first,
+        last,
+        nth
+      });
+      
+      // 사람처럼 보이는 클릭 전 랜덤 딜레이
+      await sleep(100 + Math.random() * 300);
+
+      await locator.click({
+        timeout: 15000,
+        ...options
+      });
+
+      // 클릭 후 짧은 대기
+      await sleep(50 + Math.random() * 150);
+
+      console.log(`✅ 클릭 완료: ${selector}`);
+    });
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('❌ 클릭 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 9. 텍스트 입력
+app.post('/page/fill', async (req, res) => {
+  try {
+    const { 
+      sessionId, 
+      selector, 
+      text, 
+      frameSelector, 
+      frameChain, 
+      options = {},
+      getByRole,
+      getByText,
+      getByLabel,
+      getByPlaceholder,
+      getByAltText,
+      getByTitle,
+      getByTestId,
+      // advanced methods
+      filter,
+      first,
+      last,
+      nth
+    } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+
+    await withSessionMutex(sessionId, async () => {
+      const session = getSession(sessionId);
+      
+      if (!session) {
+        throw new Error('Session not found');
+      }
+
+      console.log(`⌨️ 텍스트 입력: ${selector || getByRole || getByText || getByLabel || getByPlaceholder || getByAltText || getByTitle || getByTestId} -> "${text}"`);
+
+      const locator = resolveLocator(session.page, { 
+        selector, 
+        frameSelector, 
+        frameChain,
+        getByRole,
+        getByText,
+        getByLabel,
+        getByPlaceholder,
+        getByAltText,
+        getByTitle,
+        getByTestId,
+        filter,
+        first,
+        last,
+        nth
+      });
+
+      // 사람처럼 보이는 입력 전 랜덤 딜레이
+      await sleep(100 + Math.random() * 300);
+
+      try {
+        await locator.fill(text, {
+          timeout: 15000,
+          ...options
+        });
+      } catch {
+        console.log(`🔄 대체 입력 방식 사용: ${selector}`);
+        await locator.click({ timeout: 15000 });
+        await session.page.keyboard.down('Control');
+        await session.page.keyboard.press('KeyA');
+        await session.page.keyboard.up('Control');
+        // 사람처럼 보이는 타이핑 딜레이 (60-90ms)
+        await session.page.keyboard.type(text, { delay: 60 + Math.random() * 30 });
+      }
+
+      // 입력 후 짧은 대기
+      await sleep(50 + Math.random() * 150);
+
+      console.log(`✅ 텍스트 입력 완료: ${selector}`);
+    });
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('❌ 텍스트 입력 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 10. 요소 대기
+app.post('/page/waitFor', async (req, res) => {
+  try {
+    const { 
+      sessionId, 
+      selector, 
+      frameSelector, 
+      frameChain, 
+      options = {},
+      getByRole,
+      getByText,
+      getByLabel,
+      getByPlaceholder,
+      getByAltText,
+      getByTitle,
+      getByTestId,
+      // advanced methods
+      filter,
+      first,
+      last,
+      nth
+    } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId is required' });
+    }
+
+    await withSessionMutex(sessionId, async () => {
+      const session = getSession(sessionId);
+      
+      if (!session) {
+        throw new Error('Session not found');
+      }
+
+      console.log(`⏳ 요소 대기: ${selector || getByRole || getByText || getByLabel || getByPlaceholder || getByAltText || getByTitle || getByTestId}`);
+
+      const locator = resolveLocator(session.page, { 
+        selector, 
+        frameSelector, 
+        frameChain,
+        getByRole,
+        getByText,
+        getByLabel,
+        getByPlaceholder,
+        getByAltText,
+        getByTitle,
+        getByTestId,
+        filter,
+        first,
+        last,
+        nth
+      });
+      
+      await locator.waitFor({
+        timeout: 30000,
+        ...options
+      });
+
+      console.log(`✅ 요소 대기 완료: ${selector}`);
+    });
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('❌ 요소 대기 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 11. 스크린샷
+app.post('/page/screenshot', async (req, res) => {
+  try {
+    const { sessionId, options = {} } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    console.log('📸 스크린샷 캡처 중...');
+
+    const screenshot = await session.page.screenshot({
+      type: 'png',
+      encoding: 'base64',
+      fullPage: false,
+      ...options
+    });
+
+    console.log('✅ 스크린샷 완료');
+
+    res.json({ 
+      success: true, 
+      screenshot: screenshot 
+    });
+
+  } catch (error) {
+    console.error('❌ 스크린샷 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 12. 텍스트 가져오기
+app.post('/page/getText', async (req, res) => {
+  try {
+    const { sessionId, selector } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const text = await session.page.textContent(selector);
+    
+    res.json({ 
+      success: true, 
+      text: text 
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 13. 속성 가져오기
+app.post('/page/getAttribute', async (req, res) => {
+  try {
+    const { sessionId, selector, attribute } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const value = await session.page.getAttribute(selector, attribute);
+    
+    res.json({ 
+      success: true, 
+      value: value 
+    });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 14. 키보드 입력
+app.post('/page/keyboard', async (req, res) => {
+  try {
+    const { sessionId, action, key, text, delay = 50, repeat = 1 } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    // 사람처럼 보이는 키보드 전 랜덤 딜레이
+    await sleep(50 + Math.random() * 100);
+
+    switch (action) {
+      case 'press':
+        for (let i = 0; i < repeat; i++) {
+          await session.page.keyboard.press(key);
+          if (repeat > 1 && delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+        }
+        break;
+      case 'type':
+        // 사람처럼 보이는 타이핑 딜레이 강화 (60-150ms)
+        const humanDelay = Math.max(delay, 60 + Math.random() * 90);
+        await session.page.keyboard.type(text, { delay: humanDelay });
+        break;
+      case 'insertText':
+        // 개행 문자를 실제 Enter 키로 처리하고 유니코드 안전 입력
+        const lines = text.replace(/\r\n/g, '\n').split('\n');
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i]) {
+            // 유니코드 안전 입력 (이모지 포함) + 사람처럼 보이는 딜레이
+            const humanInsertDelay = Math.max(delay, 60 + Math.random() * 90);
+            await session.page.keyboard.type(lines[i], { delay: humanInsertDelay });
+          }
+          if (i < lines.length - 1) {
+            await session.page.keyboard.press('Enter');
+            await sleep(50 + Math.random() * 100); // 개행 후 짧은 대기
+          }
+        }
+        break;
+      case 'down':
+        await session.page.keyboard.down(key);
+        break;
+      case 'up':
+        await session.page.keyboard.up(key);
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid keyboard action' });
+    }
+
+    res.json({ success: true });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 15. 스크롤
+app.post('/page/scroll', async (req, res) => {
+  try {
+    const { sessionId, x = 0, y = 0 } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    await session.page.evaluate(({ x, y }) => {
+      window.scrollBy(x, y);
+    }, { x, y });
+
+    res.json({ success: true });
+
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 16. 파일 업로드 (일반)
+app.post('/page/uploadFile', async (req, res) => {
+  try {
+    const { 
+      sessionId, 
+      selector, 
+      frameSelector, 
+      frameChain,
+      files,
+      options = {},
+      getByRole,
+      getByText,
+      getByLabel,
+      getByPlaceholder,
+      getByAltText,
+      getByTitle,
+      getByTestId,
+      // advanced methods
+      filter,
+      first,
+      last,
+      nth
+    } = req.body;
+    const session = getSession(sessionId);
+    
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    if (!files || !Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: 'files array is required' });
+    }
+
+    console.log(`📁 파일 업로드 시작: ${files.length}개 파일`);
+
+    // 파일 데이터 처리
+    const fileInputs = files.map(file => {
+      if (file.base64) {
+        // Base64 데이터 처리
+        const base64Data = file.base64.replace(/^data:[^;]+;base64,/, '');
+        return {
+          name: file.name || 'file',
+          mimeType: file.mimeType || 'application/octet-stream',
+          buffer: Buffer.from(base64Data, 'base64')
+        };
+      } else if (file.path) {
+        // 로컬 파일 경로
+        return file.path;
+      } else if (file.buffer && file.name) {
+        // 직접 buffer 제공
+        return {
+          name: file.name,
+          mimeType: file.mimeType || 'application/octet-stream',
+          buffer: Buffer.from(file.buffer)
+        };
+      } else {
+        throw new Error('Invalid file format: requires base64, path, or buffer+name');
+      }
+    });
+
+    // 파일 input 요소에 파일 설정
+    if (selector || getByRole || getByText || getByLabel || getByPlaceholder || getByAltText || getByTitle || getByTestId) {
+      // 특정 selector 또는 getBy 메소드 사용
+      const locator = resolveLocator(session.page, { 
+        selector, 
+        frameSelector, 
+        frameChain,
+        getByRole,
+        getByText,
+        getByLabel,
+        getByPlaceholder,
+        getByAltText,
+        getByTitle,
+        getByTestId,
+        filter,
+        first,
+        last,
+        nth
+      });
+      
+      if (files.length === 1) {
+        await locator.setInputFiles(fileInputs[0], options);
+      } else {
+        await locator.setInputFiles(fileInputs, options);
+      }
+    } else {
+      // selector가 없으면 페이지의 첫 번째 file input 찾기
+      const fileInput = session.page.locator('input[type="file"]').first();
+      
+      if (files.length === 1) {
+        await fileInput.setInputFiles(fileInputs[0], options);
+      } else {
+        await fileInput.setInputFiles(fileInputs, options);
+      }
+    }
+
+    console.log('✅ 파일 업로드 완료');
+
+    res.json({ 
+      success: true,
+      uploadedFiles: files.map(f => f.name || f.path),
+      count: files.length
+    });
+
+  } catch (error) {
+    console.error('❌ 파일 업로드 실패:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+
+// 에러 핸들링
+app.use((error, req, res, next) => {
+  console.error('서버 오류:', error);
+  res.status(500).json({ 
+    success: false,
+    error: 'Internal server error',
+    message: error.message
+  });
+});
+
+// 서버 시작
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('🚀 Playwright HTTP API Server Started!');
+  console.log(`📡 Server: http://localhost:${PORT}`);
+  console.log('📋 Available endpoints:');
+  console.log('  GET  /health              - 서버 상태');
+  console.log('  GET  /sessions            - 활성 세션 목록');
+  console.log('  POST /browser/launch      - 브라우저 시작');
+  console.log('  POST /browser/close       - 브라우저 종료');
+  console.log('  POST /page/goto           - 페이지 이동');
+  console.log('  POST /page/content        - HTML 가져오기');
+  console.log('  POST /page/info           - 페이지 정보');
+  console.log('  POST /page/evaluate       - JavaScript 실행');
+  console.log('  POST /page/click          - 요소 클릭');
+  console.log('  POST /page/fill           - 텍스트 입력');
+  console.log('  POST /page/screenshot     - 스크린샷');
+  console.log('  POST /page/uploadFile     - 파일 업로드');
+  console.log('');
+  console.log('✨ 준비 완료! 크롤링을 시작하세요.');
+});
+
+// 프로세스 종료 시 모든 브라우저 정리
+process.on('SIGINT', async () => {
+  console.log('\n🔄 서버 종료 중...');
+  
+  for (const [sessionId, session] of sessions.entries()) {
+    try {
+      await session.browser.close();
+      console.log(`✅ 세션 종료: ${sessionId}`);
+    } catch (error) {
+      console.error(`❌ 세션 종료 실패 ${sessionId}:`, error.message);
+    }
+  }
+  
+  // 모든 뮤텍스 정리
+  sessionMutexes.clear();
+  console.log('🧹 모든 뮤텍스 정리 완료');
+  
+  console.log('👋 서버 종료 완료');
+  process.exit(0);
+});
