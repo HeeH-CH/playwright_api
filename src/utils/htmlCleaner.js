@@ -1,13 +1,13 @@
-// HTML 정리 유틸리티 함수
-function cleanHtmlContent(html, options = {}) {
-  if (!options.clean) {
-    return html;
-  }
+// utils/htmlCleaner.js
+const { JSDOM } = require('jsdom');
+const sanitizeHtml = require('sanitize-html');
+const he = require('he');
 
-  let cleanedHtml = html;
+function cleanHtmlContent(html, opt = {}) {
+  if (!opt.clean) return html;
 
-  // 기본 정리 옵션들
-  const defaultOptions = {
+  const o = {
+    // 레거시 플래그 기본값(이전 코드와 동일한 의미)
     removeImages: true,
     removeVideos: true,
     removeAudios: true,
@@ -17,85 +17,77 @@ function cleanHtmlContent(html, options = {}) {
     removeEmptyElements: true,
     removeForms: false,
     removeIframes: false,
-    ...options
+    // 커스텀 허용 옵션
+    allowedTags: null,
+    allowedAttributes: null,
+    ...opt
   };
 
-  try {
-    // 1. 이미지 제거
-    if (defaultOptions.removeImages) {
-      cleanedHtml = cleanedHtml.replace(/<img[^>]*>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<picture[^>]*>[\s\S]*?<\/picture>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<figure[^>]*>[\s\S]*?<\/figure>/gi, '');
-    }
+  const dom = new JSDOM(html);
+  const { document, NodeFilter } = dom.window;
 
-    // 2. 비디오/오디오 제거
-    if (defaultOptions.removeVideos) {
-      cleanedHtml = cleanedHtml.replace(/<video[^>]*>[\s\S]*?<\/video>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<source[^>]*>/gi, '');
-    }
+  // 1) 레거시 플래그 해석 → 셀렉터 제거
+  const kill = [];
+  if (o.removeScripts) kill.push('script','noscript');
+  if (o.removeStyles) kill.push('style','link[rel="stylesheet"]','[style]');
+  if (o.removeIframes) kill.push('iframe','embed','object');
+  if (o.removeImages) kill.push('img','picture','figure');
+  if (o.removeVideos) kill.push('video','source','track');
+  if (o.removeAudios) kill.push('audio');
+  if (o.removeForms)  kill.push('form','input','select','textarea','button');
 
-    if (defaultOptions.removeAudios) {
-      cleanedHtml = cleanedHtml.replace(/<audio[^>]*>[\s\S]*?<\/audio>/gi, '');
-    }
+  if (kill.length) document.querySelectorAll(kill.join(',')).forEach(n => n.remove());
 
-    // 3. 스크립트 제거
-    if (defaultOptions.removeScripts) {
-      cleanedHtml = cleanedHtml.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
-    }
+  // 광고/배너 휴리스틱
+  document.querySelectorAll('[class*="ad"],[id*="ad"],[class*="banner"],[id*="banner"]').forEach(n => n.remove());
 
-    // 4. 스타일 제거
-    if (defaultOptions.removeStyles) {
-      cleanedHtml = cleanedHtml.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/\sstyle\s*=\s*["'][^"']*["']/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<link[^>]*rel\s*=\s*["']stylesheet["'][^>]*>/gi, '');
-    }
-
-    // 5. 주석 제거
-    if (defaultOptions.removeComments) {
-      cleanedHtml = cleanedHtml.replace(/<!--[\s\S]*?-->/g, '');
-    }
-
-    // 6. 폼 요소 제거 (옵션)
-    if (defaultOptions.removeForms) {
-      cleanedHtml = cleanedHtml.replace(/<form[^>]*>[\s\S]*?<\/form>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<input[^>]*>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<textarea[^>]*>[\s\S]*?<\/textarea>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<select[^>]*>[\s\S]*?<\/select>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<button[^>]*>[\s\S]*?<\/button>/gi, '');
-    }
-
-    // 7. iframe 제거 (옵션)
-    if (defaultOptions.removeIframes) {
-      cleanedHtml = cleanedHtml.replace(/<iframe[^>]*>[\s\S]*?<\/iframe>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<embed[^>]*>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/<object[^>]*>[\s\S]*?<\/object>/gi, '');
-    }
-
-    // 8. 광고 및 추적 관련 제거
-    cleanedHtml = cleanedHtml.replace(/<div[^>]*class[^>]*ad[^>]*>[\s\S]*?<\/div>/gi, '');
-    cleanedHtml = cleanedHtml.replace(/<div[^>]*id[^>]*ad[^>]*>[\s\S]*?<\/div>/gi, '');
-    cleanedHtml = cleanedHtml.replace(/<div[^>]*class[^>]*banner[^>]*>[\s\S]*?<\/div>/gi, '');
-
-    // 9. 빈 요소 제거 (옵션)
-    if (defaultOptions.removeEmptyElements) {
-      // 빈 태그들 제거 (단, br, hr, img 등 self-closing 태그는 제외)
-      cleanedHtml = cleanedHtml.replace(/<(div|span|p|h[1-6]|section|article)[^>]*>\s*<\/\1>/gi, '');
-      cleanedHtml = cleanedHtml.replace(/^\s*[\r\n]/gm, ''); // 빈 줄 제거
-    }
-
-    // 10. 여러 공백을 하나로 정리
-    cleanedHtml = cleanedHtml.replace(/\s+/g, ' ');
-    cleanedHtml = cleanedHtml.replace(/>\s+</g, '><');
-
-    return cleanedHtml.trim();
-
-  } catch (error) {
-    console.error('❌ HTML 정리 중 오류:', error);
-    return html; // 오류 시 원본 반환
+  // 주석 제거
+  if (o.removeComments) {
+    const walker = document.createTreeWalker(document, NodeFilter.SHOW_COMMENT, null, false);
+    const comments = [];
+    while (walker.nextNode()) comments.push(walker.currentNode);
+    comments.forEach(c => c.parentNode && c.parentNode.removeChild(c));
   }
+
+  // 2) sanitize: 허용 태그/속성
+  const defaultAllowedTags = [
+    'p','h1','h2','h3','ul','ol','li','a','strong','em','code','pre','blockquote','br',
+    'table','thead','tbody','tr','th','td','hr','span','div','section','article'
+  ];
+  const allowedTags = Array.isArray(o.allowedTags) && o.allowedTags.length
+    ? o.allowedTags
+    : defaultAllowedTags;
+
+  const defaultAllowedAttrs = { a: ['href','title'], td: ['colspan','rowspan'], th: ['colspan','rowspan'], '*': ['lang'] };
+  const allowedAttributes = o.allowedAttributes || defaultAllowedAttrs;
+
+  let cleaned = sanitizeHtml(dom.serialize(), {
+    allowedTags,
+    allowedAttributes,
+    allowedSchemes: ['http','https','mailto','tel'],
+    transformTags: {
+      a: (tag, attrs) => {
+        if (attrs.href) {
+          try {
+            const u = new URL(attrs.href, 'https://dummy.local');
+            ['utm_source','utm_medium','utm_campaign','utm_term','utm_content','cid','n_media','n_query','n_rank','n_ad_group']
+              .forEach(p => u.searchParams.delete(p));
+            attrs.href = u.pathname + (u.search || '') + (u.hash || '');
+          } catch (_) {}
+        }
+        return { tagName: 'a', attribs: attrs };
+      }
+    }
+  });
+
+  // 3) 빈 요소 제거(옵션)
+  if (o.removeEmptyElements) {
+    cleaned = cleaned.replace(/<(div|span|p|section|article|h[1-6])[^>]*>\s*<\/\1>/gi, '');
+  }
+
+  // 4) 공백 정리 + 엔티티 디코딩
+  cleaned = cleaned.replace(/>\s+</g, '><').replace(/\s{2,}/g, ' ').trim();
+  return he.decode(cleaned);
 }
 
-module.exports = {
-  cleanHtmlContent
-};
+module.exports = { cleanHtmlContent };
