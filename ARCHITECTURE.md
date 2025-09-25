@@ -17,8 +17,8 @@
 playwright-api/
 ├── server.js                 # 메인 서버 파일 (모듈화됨)
 ├── package.json             # 의존성 관리
-├── API_DOCUMENTATION.md     # API 사용 가이드
 ├── ARCHITECTURE.md          # 아키텍처 문서 (본 파일)
+├── README.md                # 요약 안내 및 스텔스 옵션 설명
 ├── src/                     # 소스 코드 모듈들
 │   ├── middleware/          # 미들웨어 모듈
 │   │   ├── cors.js         # CORS 설정
@@ -29,12 +29,15 @@ playwright-api/
 │   │   ├── page.js         # 페이지 관련 엔드포인트
 │   │   └── session.js      # 세션 관리 엔드포인트
 │   └── utils/              # 유틸리티 모듈
-│       ├── htmlCleaner.js  # HTML 정리 기능
-│       ├── locatorResolver.js # 선택자 해결 로직
-│       └── sessionManager.js  # 세션 생명주기 관리
-└── legacy/                  # 백업된 기존 파일들
-    ├── server_legacy_*.js   # 이전 버전 백업
-    └── server.js.old       # 구버전 파일
+│       ├── browserFactory.js   # 브라우저/스텔스 모드 선택 로직
+│       ├── htmlCleaner.js      # HTML 정리 기능
+│       ├── locatorResolver.js  # 선택자 해결 로직
+│       └── sessionManager.js   # 세션 생명주기 관리
+└── legacy/                  # 백업 및 실험 버전 보관소
+    ├── server.js.old             # 구버전 메인 파일
+    ├── server.js.stealth         # 스텔스 실험 버전 (참고용)
+    ├── server_backup_*.js        # 백업 저장본
+    └── server_legacy_*.js        # 과거 릴리즈 스냅샷
 ```
 
 ---
@@ -76,11 +79,12 @@ server.js
 │   ├── cors.js
 │   └── mutex.js
 ├── routes/
-│   ├── browser.js    → utils/sessionManager
+│   ├── browser.js    → utils/sessionManager, utils/browserFactory
 │   ├── page.js       → utils/sessionManager, utils/htmlCleaner
 │   ├── interaction.js → utils/sessionManager, utils/locatorResolver
 │   └── session.js    → utils/sessionManager
 └── utils/
+    ├── browserFactory.js
     ├── htmlCleaner.js
     ├── locatorResolver.js
     └── sessionManager.js
@@ -121,6 +125,12 @@ server.js
 - **메모리 관리**: 자동 세션 정리로 메모리 누수 방지
 - **재시도 로직**: 네트워크 오류 시 자동 재시도
 - **타임아웃 관리**: 작업별 타임아웃 설정
+
+### 6. 스텔스 모드 토글 ⭐ NEW
+- **기본값**: 표준 Chromium 런치 (환경 변수 미설정 시)
+- **글로벌 토글**: `DEFAULT_STEALTH_MODE=true` 또는 `STEALTH_MODE=true`로 서버 기동 시 기본 스텔스 적용
+- **요청 단위 제어**: `/browser/launch` 요청 본문에 `"stealth": true`/`false` 지정 가능
+- **Chromium 한정**: Firefox/WebKit은 스텔스 요청 시 경고 후 표준 모드 유지
 
 ---
 
@@ -487,3 +497,9 @@ page.on('console', msg => console.log('PAGE LOG:', msg.text()));
 **🎭 API 버전**: 2.0.0 (Modular)
 **🔧 Playwright 버전**: Latest
 **👨‍💻 아키텍처**: Express.js + Modular Design
+- HTML 정리 및 통계 제공
+
+### 스텔스 모드 전환 (Stealth Mode Toggle)
+- `src/utils/browserFactory.js`가 브라우저 엔진을 선택하고 스텔스 플러그인을 지연 로딩
+- 환경 변수 및 API 요청 모두에서 스텔스 모드 지정 가능
+- 세션 정보에 `mode` 필드를 기록해 런타임 상태 확인 지원

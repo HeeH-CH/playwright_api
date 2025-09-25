@@ -1,7 +1,11 @@
 const express = require('express');
-const { chromium, firefox, webkit } = require('playwright');
 const { sessions, generateSessionId, getSession } = require('../utils/sessionManager');
 const { sessionMutexes } = require('../middleware/mutex');
+const {
+  getBrowserEngine,
+  getDefaultStealthMode,
+  parseBoolean
+} = require('../utils/browserFactory');
 
 const router = express.Router();
 
@@ -14,12 +18,22 @@ router.post('/launch', async (req, res) => {
       viewport = { width: 1920, height: 1080 },
       userAgent,
       locale = 'ko-KR',
-      timezone = 'Asia/Seoul'
+      timezone = 'Asia/Seoul',
+      stealth
     } = req.body;
 
-    console.log(`🚀 브라우저 시작: ${browser}, headless: ${headless}`);
+    const requestedStealth = stealth !== undefined
+      ? parseBoolean(stealth)
+      : getDefaultStealthMode();
 
-    let browserInstance;
+    const {
+      engine,
+      name: resolvedBrowser,
+      stealth: stealthEnabled
+    } = getBrowserEngine(browser, { useStealth: requestedStealth });
+
+    console.log(`🚀 브라우저 시작: ${resolvedBrowser}, headless: ${headless}, stealth: ${stealthEnabled}`);
+
     const launchOptions = {
       headless,
       args: [
@@ -30,17 +44,7 @@ router.post('/launch', async (req, res) => {
       ]
     };
 
-    // 브라우저 타입별 실행
-    switch (browser.toLowerCase()) {
-      case 'firefox':
-        browserInstance = await firefox.launch(launchOptions);
-        break;
-      case 'webkit':
-        browserInstance = await webkit.launch(launchOptions);
-        break;
-      default:
-        browserInstance = await chromium.launch(launchOptions);
-    }
+    const browserInstance = await engine.launch(launchOptions);
 
     // 브라우저 컨텍스트 생성
     const context = await browserInstance.newContext({
@@ -60,7 +64,8 @@ router.post('/launch', async (req, res) => {
       context,
       page,
       createdAt: new Date(),
-      lastActivity: new Date()
+      lastActivity: new Date(),
+      mode: stealthEnabled ? 'stealth' : 'standard'
     });
 
     console.log(`✅ 브라우저 시작 완료: ${sessionId}`);
@@ -68,9 +73,10 @@ router.post('/launch', async (req, res) => {
     res.json({
       success: true,
       sessionId,
-      browser: browser,
+      browser: resolvedBrowser,
       headless: headless,
-      message: `${browser} browser launched successfully`
+      stealth: stealthEnabled,
+      message: `${resolvedBrowser} browser launched successfully`
     });
 
   } catch (error) {
